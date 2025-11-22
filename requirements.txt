@@ -1,4 +1,0 @@
-Flask
-mediapipe
-opencv-python-headless
-numpy

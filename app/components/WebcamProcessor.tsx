@@ -2,86 +2,155 @@
 
 import { useRef, useEffect, useState } from 'react';
 
+// TypeScript declarations for MediaPipe
+declare global {
+    interface Window {
+        Hands: any;
+        Camera: any;
+    }
+}
+
 export default function WebcamProcessor() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const [subtitle, setSubtitle] = useState<string>("Waiting for gesture...");
-    const [isProcessing, setIsProcessing] = useState(false);
+    const [subtitle, setSubtitle] = useState<string>("Loading...");
     const [error, setError] = useState<string | null>(null);
+    const [isLoaded, setIsLoaded] = useState(false);
 
     useEffect(() => {
-        let intervalId: NodeJS.Timeout;
+        // Load MediaPipe scripts
+        const loadMediaPipe = async () => {
+            if (typeof window === 'undefined') return;
 
-        const startVideo = async () => {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                if (videoRef.current) {
-                    videoRef.current.srcObject = stream;
-                }
-            } catch (err) {
-                console.error("Error accessing webcam:", err);
-                setError("Could not access webcam. Please allow camera permissions.");
-            }
+            // Load Hands script
+            const handsScript = document.createElement('script');
+            handsScript.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js';
+            handsScript.crossOrigin = 'anonymous';
+            document.body.appendChild(handsScript);
+
+            // Load Camera Utils script
+            const cameraScript = document.createElement('script');
+            cameraScript.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js';
+            cameraScript.crossOrigin = 'anonymous';
+            document.body.appendChild(cameraScript);
+
+            // Wait for scripts to load
+            await new Promise((resolve) => {
+                handsScript.onload = () => {
+                    cameraScript.onload = resolve;
+                };
+            });
+
+            setIsLoaded(true);
         };
 
-        startVideo();
+        loadMediaPipe().catch((err) => {
+            console.error('Failed to load MediaPipe:', err);
+            setError('Failed to load gesture detection library');
+        });
+    }, []);
 
-        const processFrame = async () => {
-            if (!videoRef.current || !canvasRef.current || isProcessing) return;
+    useEffect(() => {
+        if (!isLoaded || !videoRef.current || !canvasRef.current) return;
+        if (!window.Hands || !window.Camera) return;
 
-            const video = videoRef.current;
+        const hands = new window.Hands({
+            locateFile: (file: string) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            },
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+        });
+
+        hands.onResults((results: any) => {
+            if (!canvasRef.current) return;
+
+            const canvasCtx = canvasRef.current.getContext('2d');
+            if (!canvasCtx) return;
+
             const canvas = canvasRef.current;
-            const context = canvas.getContext('2d');
+            canvas.width = results.image.width;
+            canvas.height = results.image.height;
 
-            if (video.readyState === video.HAVE_ENOUGH_DATA && context) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
-                const imageData = canvas.toDataURL('image/jpeg', 0.5); // Compress to 0.5 quality
-
-                setIsProcessing(true);
-                try {
-                    const response = await fetch('/api/recognize', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({ image: imageData }),
-                    });
-
-                    if (response.ok) {
-                        const data = await response.json();
-                        setSubtitle(data.gesture || "Unknown");
-                    } else {
-                        console.error("API Error:", response.statusText);
-                    }
-                } catch (err) {
-                    console.error("Fetch Error:", err);
-                } finally {
-                    setIsProcessing(false);
-                }
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const gesture = recognizeGesture(landmarks);
+                setSubtitle(gesture);
+            } else {
+                setSubtitle("No Hand Detected");
             }
-        };
 
-        // Throttle to 1 FPS (1000ms) to respect Vercel limits
-        intervalId = setInterval(processFrame, 1000);
+            canvasCtx.restore();
+        });
+
+        const camera = new window.Camera(videoRef.current, {
+            onFrame: async () => {
+                if (videoRef.current) {
+                    await hands.send({ image: videoRef.current });
+                }
+            },
+            width: 1280,
+            height: 720,
+        });
+
+        camera.start().catch((err: any) => {
+            console.error("Error accessing webcam:", err);
+            setError("Could not access webcam. Please allow camera permissions.");
+        });
+
+        setSubtitle("Waiting for gesture...");
 
         return () => {
-            clearInterval(intervalId);
-            if (videoRef.current && videoRef.current.srcObject) {
-                const stream = videoRef.current.srcObject as MediaStream;
-                stream.getTracks().forEach(track => track.stop());
-            }
+            camera.stop();
         };
-    }, []); // Empty dependency array to run once on mount
+    }, [isLoaded]);
+
+    const recognizeGesture = (landmarks: any) => {
+        // Helper to check if finger is extended
+        const isExtended = (tipIdx: number, pipIdx: number) => {
+            return landmarks[tipIdx].y < landmarks[pipIdx].y;
+        };
+
+        const indexExt = isExtended(8, 6);
+        const middleExt = isExtended(12, 10);
+        const ringExt = isExtended(16, 14);
+        const pinkyExt = isExtended(20, 18);
+
+        const thumbTipY = landmarks[4].y;
+        const indexMcpY = landmarks[5].y;
+        const thumbUp = thumbTipY < indexMcpY && !indexExt && !middleExt && !ringExt && !pinkyExt;
+
+        if (indexExt && middleExt && ringExt && pinkyExt) {
+            return "Hello (Open Palm)";
+        } else if (!indexExt && !middleExt && !ringExt && !pinkyExt) {
+            if (thumbUp) {
+                return "Thumbs Up";
+            }
+            return "Fist / No";
+        } else if (indexExt && middleExt && !ringExt && !pinkyExt) {
+            return "Peace / V";
+        } else if (indexExt && !middleExt && !ringExt && !pinkyExt) {
+            return "One / Pointing";
+        }
+
+        return "Unknown Gesture";
+    };
 
     return (
         <div className="webcam-container">
             {error && <div className="error-message">{error}</div>}
             <div className="video-wrapper">
-                <video ref={videoRef} autoPlay playsInline muted className="webcam-video" />
-                <canvas ref={canvasRef} className="hidden-canvas" style={{ display: 'none' }} />
+                <video ref={videoRef} style={{ display: 'none' }} autoPlay playsInline muted />
+                <canvas ref={canvasRef} className="webcam-video" />
                 <div className="subtitle-overlay">
                     <p className="subtitle-text">{subtitle}</p>
                 </div>
